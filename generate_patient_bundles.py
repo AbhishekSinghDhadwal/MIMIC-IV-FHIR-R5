@@ -24,6 +24,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+from tqdm import tqdm
+
 
 SCRIPT_VERSION = "2026.04.18.1"
 FHIR_ACCEPT = "application/fhir+json"
@@ -151,6 +153,11 @@ def append_jsonl(path: Path, value: Dict[str, Any]) -> None:
     ensure_dir(path.parent)
     with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(value, ensure_ascii=True) + "\n")
+
+
+def record_timing(stats: "Stats", phase: str, elapsed_seconds: float) -> None:
+    stats.data["timing_seconds"][phase] = round(elapsed_seconds, 3)
+    print(f"[timing] {phase}={elapsed_seconds:.3f}s", flush=True)
 
 
 def relative_ref(resource_type: str, resource_id: str) -> str:
@@ -513,6 +520,7 @@ class Stats:
             "bundle_output_bytes": 0,
             "gzip_max_staged_file_bytes": 0,
             "gzip_staged_bytes_total": 0,
+            "timing_seconds": {},
             "notes": [],
         }
 
@@ -1081,7 +1089,7 @@ def index_patient_selection(ctx: Context, selection: SelectionFilter) -> None:
             print(f"[scan] indexing {source_name}", flush=True)
             progress = ProgressPrinter(source_name)
             with source_path.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
+                for line_number, line in enumerate(tqdm(handle, desc=source_name, unit="lines"), start=1):
                     progress.maybe(line_number)
                     line = line.strip()
                     if not line:
@@ -1151,7 +1159,7 @@ def scan_corpus(ctx: Context, selection: SelectionFilter) -> None:
             print(f"[scan] indexing {source_name}", flush=True)
             progress = ProgressPrinter(source_name)
             with source_path.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
+                for line_number, line in enumerate(tqdm(handle, desc=source_name, unit="lines"), start=1):
                     progress.maybe(line_number)
                     line = line.strip()
                     if not line:
@@ -1631,7 +1639,7 @@ def build_bundles(ctx: Context, selection: SelectionFilter) -> List[Path]:
     if not ordered_patient_ids:
         ordered_patient_ids = [row["patient_id"] for row in ctx.db.iter_manifest_rows()]
 
-    for patient_id in ordered_patient_ids:
+    for patient_id in tqdm(ordered_patient_ids, desc="bundles", unit="patients"):
         output_path = ctx.bundles_dir / f"patient-{patient_id}.transaction.r5.json"
         if output_path.exists() and not ctx.args.force:
             try:
@@ -2360,6 +2368,7 @@ def remove_work_db_if_needed(db: WorkDb, db_path: Path, keep: bool) -> None:
 
 
 def main(argv: Sequence[str]) -> int:
+    run_started = time.perf_counter()
     args = parse_args(argv)
     if args.offset < 0:
         raise ValueError("--offset must be >= 0")
@@ -2373,9 +2382,11 @@ def main(argv: Sequence[str]) -> int:
 
     output_dir = Path(args.output_dir).resolve() if args.output_dir else (repo_root / "output").resolve()
     ensure_dir(output_dir)
+    phase_started = time.perf_counter()
     ndjson_dir, input_prep = prepare_input_directory(discovered_ndjson_dir, output_dir, args.gz, args.force)
     db, db_path = prepare_db(args, output_dir, build_run_signature(args, ndjson_dir, input_prep))
     ctx = Context(args, repo_root, ndjson_dir, ig_package_dir, output_dir, db, input_prep)
+    record_timing(ctx.stats, "input_preparation", time.perf_counter() - phase_started)
     selection = SelectionFilter(args.patient_ids.split(","), args.num_patients, args.offset)
 
     try:
@@ -2393,14 +2404,30 @@ def main(argv: Sequence[str]) -> int:
             f"SQLite staging uses journal_mode=DELETE, temp_store=FILE, cache_size={SQLITE_CACHE_MB}MB, "
             "and incremental vacuum to reduce RAM and reclaim deleted patient payload pages."
         )
+        phase_started = time.perf_counter()
         index_patient_selection(ctx, selection)
+        record_timing(ctx.stats, "patient_selection_index", time.perf_counter() - phase_started)
+
+        phase_started = time.perf_counter()
         scan_corpus(ctx, selection)
+        record_timing(ctx.stats, "corpus_scan", time.perf_counter() - phase_started)
         ctx.db.commit()
+
+        phase_started = time.perf_counter()
         emitted_paths = build_bundles(ctx, selection)
+        record_timing(ctx.stats, "bundle_generation", time.perf_counter() - phase_started)
         export_manifest(ctx)
+
+        phase_started = time.perf_counter()
         import_samples(ctx, emitted_paths)
+        record_timing(ctx.stats, "server_import_tests", time.perf_counter() - phase_started)
+
+        phase_started = time.perf_counter()
         write_stats(ctx)
         write_production_safety_report(ctx)
+        record_timing(ctx.stats, "final_reports", time.perf_counter() - phase_started)
+        record_timing(ctx.stats, "total_run", time.perf_counter() - run_started)
+        write_stats(ctx)
 
         print(
             f"[done] emitted={ctx.stats.data['bundles_emitted']} blocked={ctx.stats.data['bundles_blocked']} "
